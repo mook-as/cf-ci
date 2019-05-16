@@ -1,0 +1,230 @@
+---
+# Concourse pipeline to deploy and upgrade CAP
+
+resource_types:
+- name: github-status
+  type: docker-image
+  source:
+    repository: resource/github-status
+    tag: release
+
+resources:
+# USB sidecar archive for postgres
+- name: s3.pg-sidecar
+  type: s3
+  source:
+    endpoint: ((s3-config-endpoint))
+    access_key_id: ((s3-config-access-key))
+    secret_access_key: ((s3-config-secret-key))
+    bucket: ((s3-config-bucket-sles))
+    regexp: ((s3-config-prefix-sidecars))cf-usb-sidecar-postgres-(.*)\.tgz$
+
+# USB sidecar archive for MySQL
+- name: s3.mysql-sidecar
+  type: s3
+  source:
+    endpoint: ((s3-config-endpoint))
+    access_key_id: ((s3-config-access-key))
+    secret_access_key: ((s3-config-secret-key))
+    bucket: ((s3-config-bucket-sles))
+    regexp: ((s3-config-prefix-sidecars))cf-usb-sidecar-mysql-(.*)\.tgz$
+
+# CI helper scripts repository
+- name: ci
+  type: git
+  source:
+    uri: ((src-ci-repo))
+    branch: ((src-ci-branch))
+    paths:
+    - qa-pipelines/*
+    - sample-apps/*
+
+# SCF bundle to install from (upgrade target, if upgrading)
+- name: s3.scf-config-sles
+  type: s3
+  source:
+    endpoint: ((s3-config-endpoint))
+    access_key_id: ((s3-config-access-key))
+    secret_access_key: ((s3-config-secret-key))
+    bucket: ((s3-config-bucket-sles))
+    regexp: ((s3-config-prefix-sles))scf-sle-(.*)\.zip$
+
+# Pool resource with kube cluster information
+- name: pool.kube-hosts
+  type: pool
+  source:
+    uri: ((kube-pool-repo))
+    private_key: ((kube-pool-key))
+    branch: ((kube-pool-branch))
+    pool: ((kube-pool-pool))
+
+# GitHub commit status
+- name: status.src
+  type: github-status
+  source:
+    repo: ((src-repo))
+    access_token: ((github-access-token))
+
+# This section only exists to reduce repetition
+anchors:
+  pre-upgrade-bundle-url: &pre-upgrade-bundle-url
+    https://((s3-config-bucket-sles)).s3.amazonaws.com/((s3-config-prefix-sles))/<%= ERB::Util.url_encode(upgrade.from_version) %>.zip
+
+jobs:
+<% %w(SA HA).each do |avail| %>
+<% next if avail == 'HA' and not ha %>
+<% next if avail == 'SA' and not sa %>
+- name: ((pipeline-name))-<%= avail %>
+  plan:
+  - do:
+    - aggregate:
+      - get: ci
+      - get: s3.pg-sidecar
+        trigger: true
+      - get: s3.mysql-sidecar
+        trigger: true
+      - get: s3.scf-config-sles
+        trigger: true
+      - put: pool.kube-hosts
+        params: {acquire: true}
+    - task: cf-get-commit-id
+      file: ci/qa-pipelines/tasks/cf-get-commit-id.yml
+      input_mapping:
+        s3.archive: s3.scf-config-sles
+    <% if status_reporting %>
+    - put: status.src
+      params: &status-params-<%= avail %>
+        context: ((pipeline-name))-<%= avail %>
+        description: "QA Pipeline: ((pipeline-name)) (SLES <%= avail %>)"
+        path: commit-id/sha
+        state: pending
+    <% end %> # status_reporting
+    on_failure:
+      put: pool.kube-hosts
+      params: {release: pool.kube-hosts}
+  - do:
+    <% if upgrade.from_version %>
+    - task: cf-deploy-pre-upgrade
+      file: ci/qa-pipelines/tasks/cf-deploy.yml
+      params:
+        KUBE_REGISTRY_HOSTNAME: ((registry-hostname))
+        KUBE_REGISTRY_USERNAME: ((registry-username))
+        KUBE_REGISTRY_PASSWORD: ((registry-password))
+        KUBE_ORGANIZATION: ((organization))
+        HA: <%= avail == 'HA' %>
+        MAGIC_DNS_SERVICE: ((magic-dns-service))
+        CAP_BUNDLE_URL: *pre-upgrade-bundle-url
+      input_mapping:
+        s3.scf-config: s3.scf-config-sles
+    <% if upgrade.cf_usb %>
+    - task: usb-deploy-pre-upgrade
+      file: ci/qa-pipelines/tasks/usb-deploy.yml
+    <% end %> # upgrade.cf_usb
+    <% if upgrade.smoke_tests %>
+    - task: cf-smoke-tests-pre-upgrade
+      file: ci/qa-pipelines/tasks/run-test.yml
+      params:
+        CAP_BUNDLE_URL: *pre-upgrade-bundle-url
+        TEST_NAME: smoke-tests
+      input_mapping:
+        s3.scf-config: s3.scf-config-sles
+    <% end %> # upgrade.smoke_tests
+    <% if upgrade.acceptance_tests %>
+    - task: acceptance-tests-brain-pre-upgrade
+      file: ci/qa-pipelines/tasks/run-test.yml
+      params:
+        CAP_BUNDLE_URL: *pre-upgrade-bundle-url
+        TEST_NAME: acceptance-tests-brain
+      input_mapping:
+        s3.scf-config: s3.scf-config-sles
+    <% end %> # upgrade.acceptance_tests
+    <% if upgrade.acceptance_tests %>
+    - task: acceptance-tests-pre-upgrade
+      file: ci/qa-pipelines/tasks/run-test.yml
+      params:
+        CAP_BUNDLE_URL: *pre-upgrade-bundle-url
+        TEST_NAME: acceptance-tests
+      input_mapping:
+        s3.scf-config: s3.scf-config-sles
+    <% end %> # upgrade.acceptance_tests
+    - task: cf-upgrade
+      file: ci/qa-pipelines/tasks/cf-upgrade.yml
+      params:
+        KUBE_REGISTRY_HOSTNAME: ((registry-hostname))
+        KUBE_REGISTRY_USERNAME: ((registry-username))
+        KUBE_REGISTRY_PASSWORD: ((registry-password))
+        KUBE_ORGANIZATION: ((organization))
+        HA: <%= avail == 'HA' %>
+        MAGIC_DNS_SERVICE: ((magic-dns-service))
+      input_mapping:
+        s3.scf-config: s3.scf-config-sles
+    <% if upgrade.cf_usb %>
+    - task: usb-post-upgrade
+      file: ci/qa-pipelines/tasks/usb-post-upgrade.yml
+      params:
+        ENABLE_USB_POST_UPGRADE: ((enable-usb-post-upgrade))
+    <% end %> # upgrade.cf_usb
+    <% else %> # upgrade.from_version
+    <% if deploy %>
+    - task: cf-deploy
+      file: ci/qa-pipelines/tasks/cf-deploy.yml
+      params:
+        KUBE_REGISTRY_HOSTNAME: ((registry-hostname))
+        KUBE_REGISTRY_USERNAME: ((registry-username))
+        KUBE_REGISTRY_PASSWORD: ((registry-password))
+        KUBE_ORGANIZATION: ((organization))
+        HA: <%= avail == 'HA' %>
+        MAGIC_DNS_SERVICE: ((magic-dns-service))
+      input_mapping:
+        s3.scf-config: s3.scf-config-sles
+    <% end %> # deploy
+    <% end %> # upgrade.from_version
+    <% if smoke_tests %>
+    - task: cf-smoke-tests
+      file: ci/qa-pipelines/tasks/run-test.yml
+      params:
+        TEST_NAME: smoke-tests
+      input_mapping:
+        s3.scf-config: s3.scf-config-sles
+    <% end %> # smoke_tests
+    <% if brain_tests %>
+    - task: acceptance-tests-brain
+      file: ci/qa-pipelines/tasks/run-test.yml
+      params:
+        TEST_NAME: acceptance-tests-brain
+      input_mapping:
+        s3.scf-config: s3.scf-config-sles
+    <% end %> # brain_tests
+    <% if acceptance_tests %>
+    - task: acceptance-tests
+      file: ci/qa-pipelines/tasks/run-test.yml
+      params:
+        TEST_NAME: acceptance-tests
+      input_mapping:
+        s3.scf-config: s3.scf-config-sles
+    <% end %> # acceptance_tests
+    # We intentionally don't put the teardown and pool release steps in an ensure
+    # block, so that when tests fail we have a chance of examining why things are
+    # failing.
+    <% if teardown %>
+    - task: cf-teardown
+      file: ci/qa-pipelines/tasks/cf-teardown.yml
+      timeout: 1h
+    <% end %> # teardown
+    - put: pool.kube-hosts
+      params: {release: pool.kube-hosts}
+    <% if status_reporting %>
+    on_success:
+      put: status.src
+      params:
+        <<: *status-params-<%= avail %>
+        state: success
+    <% end %> # status_reporting
+    <% if status_reporting %>
+    on_failure:
+      put: status.src
+      params:
+        <<: *status-params-<%= avail %>
+        state: failure
+    <% end %> # status_reporting
+<% end %>

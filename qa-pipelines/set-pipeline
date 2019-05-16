@@ -50,9 +50,9 @@ if test -z "${1:-}" ; then
     exit 1
 fi
 vars_file="config-${pool}.yml"
-preset_file=${1}
-pipeline_name=$(basename ${preset_file})
-pipeline_name="${prefix}${pipeline_name%.yml}"
+preset_file="${1}"
+preset_name="$(basename ${preset_file} .yml)"
+pipeline_name="${prefix}${preset_name}"
 
 
 if ! test -r "${vars_file}" ; then
@@ -140,30 +140,18 @@ else
   pipeline_already_existed=false
 fi
 
-# We concatenate our secrets file, pipeline variables, preset file (which sets
-# 'enable' flags for each task needed for this pipeline deployment), and an
-# additional set of 'false' enable flags, for every flag which is not mentioned in
-# the preset file. This is created by subtracting the keys in the preset file from
-# the keys in flags.yml, which contains all possible enable flags
+# We concatenate our secrets file, pipeline variables
 fly \
     ${target:+"--target=${target}"} \
     set-pipeline \
     --non-interactive \
     --pipeline="${pipeline_name}" \
     --var pipeline-name="${pipeline_name}" \
-    --config="${pipeline_file}" \
+    --config=<(ruby generate.rb ${preset_file}) \
     --var src-ci-branch=${src_ci_branch} \
     --var s3-config-prefix-sles=${s3_config_prefix} \
-    --load-vars-from=<(
-        ${secrets_file:+gpg --decrypt --batch ${secrets_file}} # Import secrets
-        sed '/^---$/d' < "${vars_file}"                        # Config vars
-        sed '/^---$/d' < "${preset_file}"
-        ruby -r yaml << EOF | tail -n+2
-          pipeline_flags=YAML.load_file('${preset_file}').keys
-          all_flags=YAML.load_file('flags.yml').keys
-          puts YAML.dump((all_flags - pipeline_flags).zip([false].cycle).to_h)
-EOF
-    )
+    --load-vars-from="${vars_file}" \
+    ${secrets_file:+"--load-vars-from=<(gpg --decrypt --batch ${secrets_file})"}
 
 fly \
     ${target:+"--target=$target"} \
